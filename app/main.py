@@ -13,7 +13,12 @@ Prefijo de rutas: /api/apuestas
 """
 import json
 import os
+import time
+import psutil
 from contextlib import asynccontextmanager
+
+INICIO = time.time()
+READY_MAX_MEM_PERCENT = float(os.getenv("READY_MAX_MEM_PERCENT", "90"))
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -61,10 +66,28 @@ class ResolverRequest(BaseModel):
     resultado: str = Field(description="local | empate | visita")
 
 
-# TODO (alumno): implementar las rutas de salud que usará Kubernetes:
-#   - liveness: ¿el proceso está vivo? (respuesta simple).
-#   - readiness: ¿está listo para recibir tráfico? Debe verificar la BD.
-# Luego configurar livenessProbe/readinessProbe en el Deployment de EKS.
+@app.get("/livez", tags=["Health"])
+def livez():
+    """Liveness: el proceso está vivo (no depende de BD externa)."""
+    return {"alive": True, "uptime_segundos": round(time.time() - INICIO, 1)}
+
+
+@app.get("/readyz", tags=["Health"])
+def readyz():
+    """Readiness: listo solo si NO esta saturado de memoria (uso real con psutil)."""
+    from .db import ping
+    if not ping():
+        raise HTTPException(status_code=503, detail="Database connection failed")
+        
+    cpu = psutil.cpu_percent(interval=0.1)
+    memoria_usada = psutil.virtual_memory().percent
+    
+    if memoria_usada > READY_MAX_MEM_PERCENT:
+        raise HTTPException(
+            status_code=503,
+            detail={"ready": False, "cpu_%": cpu, "memoria_%": memoria_usada, "umbral_%": READY_MAX_MEM_PERCENT},
+        )
+    return {"ready": True, "db": "up", "cpu_%": cpu, "memoria_%": memoria_usada}
 
 
 @app.get("/api/apuestas/eventos")
@@ -74,9 +97,9 @@ def listar_eventos():
         with dict_cursor(conn) as cur:
             cur.execute(
                 """SELECT id, deporte, liga, equipo_local, equipo_visita,
-                          badge_local, badge_visita, inicio,
-                          cuota_local, cuota_empate, cuota_visita, estado
-                     FROM eventos_deportivos
+                        badge_local, badge_visita, inicio,
+                        cuota_local, cuota_empate, cuota_visita, estado
+                    FROM eventos_deportivos
                     WHERE estado = 'abierto'
                     ORDER BY id"""
             )
@@ -126,13 +149,13 @@ def apostar(body: ApuestaRequest, usuario: dict = Depends(usuario_actual)):
             }
             cur.execute(
                 """INSERT INTO transacciones (usuario_id, tipo, monto, saldo_post, detalle)
-                   VALUES (%s, 'apuesta', %s, %s, %s::jsonb)""",
+                    VALUES (%s, 'apuesta', %s, %s, %s::jsonb)""",
                 (usuario["id"], body.monto, saldo, json.dumps(detalle, ensure_ascii=False)),
             )
             cur.execute(
                 """INSERT INTO apuestas
-                     (usuario_id, evento_id, seleccion, monto, cuota, ganancia_potencial)
-                   VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                        (usuario_id, evento_id, seleccion, monto, cuota, ganancia_potencial)
+                    VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
                 (usuario["id"], evento["id"], body.seleccion, body.monto, cuota, ganancia),
             )
             apuesta_id = cur.fetchone()["id"]
@@ -157,12 +180,12 @@ def mis_apuestas(usuario: dict = Depends(usuario_actual)):
         with dict_cursor(conn) as cur:
             cur.execute(
                 """SELECT a.id, a.seleccion, a.monto, a.cuota, a.ganancia_potencial,
-                          a.estado, a.creada_en, a.resuelta_en,
-                          e.deporte, e.liga, e.equipo_local, e.equipo_visita,
-                          e.badge_local, e.badge_visita, e.resultado,
-                          e.goles_local, e.goles_visita
-                     FROM apuestas a
-                     JOIN eventos_deportivos e ON e.id = a.evento_id
+                            a.estado, a.creada_en, a.resuelta_en,
+                            e.deporte, e.liga, e.equipo_local, e.equipo_visita,
+                            e.badge_local, e.badge_visita, e.resultado,
+                            e.goles_local, e.goles_visita
+                        FROM apuestas a
+                        JOIN eventos_deportivos e ON e.id = a.evento_id
                     WHERE a.usuario_id = %s
                     ORDER BY a.creada_en DESC""",
                 (usuario["id"],),
@@ -213,9 +236,9 @@ def resolver_evento(evento_id: int, body: ResolverRequest, usuario: dict = Depen
                     detalle = {"apuesta_id": apuesta["id"], "evento_id": evento_id, "resultado": body.resultado}
                     cur.execute(
                         """INSERT INTO transacciones (usuario_id, tipo, monto, saldo_post, detalle)
-                           VALUES (%s, 'premio', %s, %s, %s::jsonb)""",
+                            VALUES (%s, 'premio', %s, %s, %s::jsonb)""",
                         (apuesta["usuario_id"], apuesta["ganancia_potencial"], saldo,
-                         json.dumps(detalle, ensure_ascii=False)),
+                            json.dumps(detalle, ensure_ascii=False)),
                     )
                     cur.execute(
                         "UPDATE apuestas SET estado = 'ganada', resuelta_en = NOW() WHERE id = %s",
@@ -256,9 +279,9 @@ def _liquidar_apuestas(cur, evento_id: int, resultado: str) -> tuple[int, int]:
             detalle = {"apuesta_id": apuesta["id"], "evento_id": evento_id, "resultado": resultado}
             cur.execute(
                 """INSERT INTO transacciones (usuario_id, tipo, monto, saldo_post, detalle)
-                   VALUES (%s, 'premio', %s, %s, %s::jsonb)""",
+                    VALUES (%s, 'premio', %s, %s, %s::jsonb)""",
                 (apuesta["usuario_id"], apuesta["ganancia_potencial"], saldo,
-                 json.dumps(detalle, ensure_ascii=False)),
+                    json.dumps(detalle, ensure_ascii=False)),
             )
             cur.execute(
                 "UPDATE apuestas SET estado = 'ganada', resuelta_en = NOW() WHERE id = %s",
@@ -299,11 +322,11 @@ def simular_evento(evento_id: int, usuario: dict = Depends(usuario_actual)):
 
             cur.execute(
                 """UPDATE eventos_deportivos
-                      SET estado = 'finalizado', resultado = %s,
-                          goles_local = %s, goles_visita = %s, minutos_gol = %s::jsonb
+                        SET estado = 'finalizado', resultado = %s,
+                            goles_local = %s, goles_visita = %s, minutos_gol = %s::jsonb
                     WHERE id = %s""",
                 (sim["resultado"], sim["marcador"]["local"], sim["marcador"]["visita"],
-                 json.dumps(sim["goles"], ensure_ascii=False), evento_id),
+                    json.dumps(sim["goles"], ensure_ascii=False), evento_id),
             )
             pagadas, perdidas = _liquidar_apuestas(cur, evento_id, sim["resultado"])
         conn.commit()
